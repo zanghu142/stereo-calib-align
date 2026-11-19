@@ -1,0 +1,14 @@
+build/
+build-*/
+
+*.user
+*.suo
+*.vcxproj.user
+
+captures/
+*.yml
+*.yaml
+*.png
+*.jpg
+*.jpeg
+!docs/*.png
