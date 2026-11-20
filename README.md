@@ -41,24 +41,39 @@ cmake --build build -j2
 
 ### 1. 左右单目标定
 
-鱼眼镜头分别运行以下命令，每次完成后退出，再运行下一条：
+每个相机单独运行一次程序。左相机完成并退出后，再运行右相机。根据镜头类型选择对应命令：
 
 ```bash
+# 鱼眼镜头
 ./build/stereo_csi_calibrator --mode fisheye-left --process-scale 0.5
 ./build/stereo_csi_calibrator --mode fisheye-right --process-scale 0.5
+
+# 针孔镜头
+./build/stereo_csi_calibrator --mode mono-left --process-scale 0.5
+./build/stereo_csi_calibrator --mode mono-right --process-scale 0.5
 ```
 
-默认保存为 `left_fisheye.yml`、`right_fisheye.yml`。采样时移动棋盘，覆盖不同位置、距离和倾角，每个姿态停稳；避免反光、模糊及所有样本都正对相机。
+鱼眼默认保存为 `left_fisheye.yml`、`right_fisheye.yml`；针孔默认保存为 `left_camera.yml`、`right_camera.yml`。采样时移动棋盘，覆盖画面不同位置、距离和倾角，每个姿态停稳；避免反光、模糊及所有样本都正对相机。
 
-单目默认自动采集 15 组，至少 8 组才能计算；达到目标且 RMS ≤ 1 px 时自动保存。可用 `--mono-samples 25` 增加目标组数，或按 `S` 手动采样、`C` 重新计算、`W` 强制保存。下游调平及双目模式会拒绝标定 RMS 超过 2 px 的内参。
+单目默认自动采集 15 组，至少 8 组才能计算；达到目标且 RMS ≤ 1 px 时自动保存。可用 `--mono-samples 25` 增加目标组数，或按 `S` 手动采样、`C` 重新计算、`W` 强制保存。下游调平及双目模式会拒绝标定 RMS 超过 2 px 的内参。需要更改单目输出位置时加 `--output`，例如：
+
+```bash
+./build/stereo_csi_calibrator --mode mono-left --output left_custom.yml
+```
 
 ### 2. 物理调平
 
 完成左右单目标定后，固定棋盘并运行：
 
 ```bash
+# 鱼眼镜头
 ./build/stereo_csi_calibrator --mode physical-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --process-scale 0.5
+
+# 针孔镜头
+./build/stereo_csi_calibrator --mode physical \
+  --left-mono left_camera.yml --right-mono right_camera.yml \
   --process-scale 0.5
 ```
 
@@ -66,11 +81,17 @@ cmake --build build -j2
 
 ### 3. 双目标定与校正
 
-相机位置固定后，运行：
+完成对应镜头类型的左右单目标定并固定相机位置后，运行以下一组命令。鱼眼和针孔模式必须使用各自对应的内参文件：
 
 ```bash
+# 鱼眼双目标定
 ./build/stereo_csi_calibrator --mode stereo-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --process-scale 0.5
+
+# 针孔双目标定
+./build/stereo_csi_calibrator --mode stereo \
+  --left-mono left_camera.yml --right-mono right_camera.yml \
   --process-scale 0.5
 ```
 
@@ -80,9 +101,27 @@ cmake --build build -j2
 
 **调整任一相机的安装位置或角度后，需要重新标定双目外参。**
 
-### 针孔镜头对应模式
+### 4. 常用运行命令
 
-操作流程相同，替换模式及内参文件：
+默认设备为 `/dev/video0` 和 `/dev/video1`，默认采集规格为 1920×1080、30 fps。设备、采集规格、棋盘和输出文件都可以在启动时覆盖，例如：
+
+```bash
+./build/stereo_csi_calibrator --mode stereo \
+  --left-mono left_camera.yml --right-mono right_camera.yml \
+  --left-device /dev/video2 --right-device /dev/video3 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --output stereo_extrinsics.yml \
+  --capture-dir captures
+```
+
+查看程序支持的完整选项和快捷键：
+
+```bash
+./build/stereo_csi_calibrator --help
+```
+
+模式与参数文件对应关系：
 
 | 操作 | 鱼眼 | 针孔 |
 | --- | --- | --- |
@@ -103,6 +142,9 @@ cmake --build build -j2
 | `--process-scale` | `0.25`；建议先用 `0.5`，提高检测分辨率会增加计算量 |
 | `--output` | 自定义标定结果路径，默认按模式命名 |
 | `--capture-dir` | `captures`，保存采样图片 |
+| `--mono-samples` / `--mono-max-rms` | 单目采集目标组数 `15` / 自动保存 RMS 上限 `1.0 px` |
+| `--mono-min-sharpness` | 清晰度阈值，默认 `75` |
+| `--mono-min-coverage` / `--mono-max-coverage` | 棋盘画面覆盖率范围，默认 `3%` 至 `55%` |
 | `--no-hw-preview` | 使用 OpenCV 窗口预览 |
 | `--font` | 自定义中文字体路径 |
 | `--help` | 查看完整参数 |
