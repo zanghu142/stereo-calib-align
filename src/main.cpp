@@ -4,6 +4,7 @@
 #include "frame_timing.h"
 #include "corner_refinement.h"
 #include "calibration_validation.h"
+#include "stereo_sampling.h"
 #include "hardware_preview.h"
 
 #include <opencv2/opencv.hpp>
@@ -138,7 +139,7 @@ static AppConfig parseArgs(int argc, char** argv) {
                       << "Keys: a alignment, v view, s stereo sample, c calibrate, r rectified, w write, q quit\n"
                       << "Physical modes: four-panel leveling from left/right mono intrinsics; physical-fisheye uses --left-fisheye/--right-fisheye.\n"
                       << "Physical modes show current-frame baseline and pose estimates; invalid/stale frames disable the readout.\n"
-                      << "Stereo modes compute extrinsics from synchronized samples.\n"
+                      << "Stereo modes show total/valid sample counts and auto-compute at 12 valid samples.\n"
                       << "3D: j/l yaw, i/k pitch, b/n roll, u/o zoom, 0 reset; "
                          "x axes, h reference, e errors. OpenCV window: drag to rotate, Shift+drag roll, middle-drag pan, wheel zoom.\n";
             std::exit(0);
@@ -2253,7 +2254,9 @@ static cv::Mat makeStereoCalibrationDashboard(const cv::Mat& left,
                                               const cv::Mat& right,
                                               const std::string& status_top,
                                               const std::string& status_sub,
-                                              std::size_t sample_count,
+                                              const StereoSamplingProgress& progress,
+                                              const std::string& sample_status,
+                                              const std::string& calculation_status,
                                               bool calibration_valid,
                                               double reprojection_error,
                                               double baseline_mm) {
@@ -2276,25 +2279,33 @@ static cv::Mat makeStereoCalibrationDashboard(const cv::Mat& left,
     row(title.str(), cvRound(46 * ui), cv::Scalar(255, 255, 255), 0.86, 3);
 
     std::ostringstream samples;
-    samples << (cn ? "有效同步样本：" : "Synchronized samples: ") << sample_count
-            << (sample_count < 8 ? (cn ? "（至少 8 组）" : " (need at least 8)") : "");
-    row(samples.str(), cvRound(92 * ui), sample_count >= 8 ? cv::Scalar(80, 240, 120) : cv::Scalar(0, 210, 255));
+    samples << (cn ? "样本数：" : "Samples: ") << progress.samples
+            << (cn ? "   有效样本数：" : "   Valid samples: ") << progress.valid_samples
+            << " / " << StereoSamplingProgress::auto_target
+            << (cn ? "（满 12 组自动计算）" : " (auto-compute at 12)");
+    row(samples.str(), cvRound(92 * ui), progress.valid_samples >= StereoSamplingProgress::auto_target
+        ? cv::Scalar(80, 240, 120) : cv::Scalar(0, 210, 255));
     row(status_top, cvRound(132 * ui), cv::Scalar(210, 220, 220), 0.52, 1);
     row(status_sub, cvRound(164 * ui), cv::Scalar(210, 220, 220), 0.52, 1);
 
     std::ostringstream result;
-    if (calibration_valid) {
+    if (progress.calculating) {
+        result << (cn ? "外参状态：正在计算，请稍候" : "Extrinsics: calculating, please wait");
+    } else if (calibration_valid) {
         result << (cn ? "外参状态：已计算   RMS：" : "Extrinsics: computed   RMS: ")
                << std::fixed << std::setprecision(3) << reprojection_error << " px"
                << (cn ? "   基线：" : "   baseline: ")
                << std::fixed << std::setprecision(1) << baseline_mm << " mm";
+        result << (cn ? "   参与计算：" : "   Used samples: ") << progress.solved_samples;
     } else {
         result << (cn ? "外参状态：未计算" : "Extrinsics: not computed");
     }
     row(result.str(), cvRound(210 * ui), calibration_valid ? cv::Scalar(80, 240, 120) : cv::Scalar(0, 210, 255), 0.66, 2);
-    row(cn ? "自动采样：稳定且有效时自动保存 | S 手动采样 | C 计算 | R 校正 | W 保存 | Q 退出"
-           : "Auto-capture when stable and valid | S manual | C calibrate | R rectify | W write | Q quit",
+    row(cn ? "有效样本满 12 组自动计算 | S 采样 | C 重算 | R 校正 | W 保存 | Q 退出"
+           : "Auto-compute at 12 valid samples | S capture | C calibrate | R rectify | W write | Q quit",
         cvRound(258 * ui), cv::Scalar(255, 220, 130), 0.54, 2);
+    row(sample_status, cvRound(300 * ui), cv::Scalar(210, 220, 220), 0.5, 1);
+    row(calculation_status, cvRound(338 * ui), cv::Scalar(255, 220, 130), 0.5, 1);
     row(cn ? "本界面独立于物理四宫格调平数据"
            : "This view is independent from the physical four-panel leveling view",
         panel.rows - cvRound(28 * ui), cv::Scalar(170, 180, 185), 0.42, 1);
@@ -2959,6 +2970,142 @@ int main(int argc, char** argv) {
     std::vector<cv::Point2f> previous_stereo_right;
     std::vector<cv::Point2f> last_auto_left;
     std::vector<cv::Point2f> last_auto_right;
+    StereoSamplingProgress stereo_progress;
+    std::string stereo_sample_status;
+    std::string stereo_calculation_status;
+    std::vector<std::vector<cv::Point2f>> accepted_stereo_left;
+    std::vector<std::vector<cv::Point2f>> accepted_stereo_right;
+    std::atomic<bool> stereo_calculation_requested{false};
+
+    // Both manual and automatic capture use the same quality and diversity
+    // checks. Only accepted pairs enter the calibrators' point arrays.
+    auto captureStereoSample = [&](const cv::Mat& left, const cv::Mat& right,
+                                   const std::vector<cv::Point2f>& left_points,
+                                   const std::vector<cv::Point2f>& right_points,
+                                   FrameClock::time_point left_received,
+                                   FrameClock::time_point right_received) {
+        const bool cn = g_text_renderer.available();
+        std::string rejection;
+        const auto board_size = cv::Size(app.board_cols, app.board_rows);
+        if (left.size() != image_size || right.size() != image_size) {
+            rejection = cn ? "图像尺寸与标定不匹配" : "image size does not match calibration";
+        } else if (!freshFramePair(left_received, right_received, FrameClock::now())) {
+            rejection = cn ? "帧过期或左右时间差过大" : "stale or skewed frames";
+        } else if (left_points.empty() || right_points.empty()) {
+            rejection = cn ? "未同时检测到棋盘" : "chessboard not detected in both cameras";
+        } else if (
+            !validCalibrationCorners(left_points, board_size, image_size) ||
+            !validCalibrationCorners(right_points, board_size, image_size)) {
+            rejection = cn ? "尺寸或角点无效" : "invalid resolution or corners";
+        } else {
+            const auto left_quality = measureMonoFrameQuality(left, left_points, board_object_points,
+                left_mono, app.mono_min_sharpness, app.mono_min_coverage, app.mono_max_coverage,
+                app.mono_max_rms, false);
+            const auto right_quality = measureMonoFrameQuality(right, right_points, board_object_points,
+                right_mono, app.mono_min_sharpness, app.mono_min_coverage, app.mono_max_coverage,
+                app.mono_max_rms, false);
+            if (!left_quality.sharpness_ok || !right_quality.sharpness_ok) {
+                rejection = cn ? "清晰度不足" : "insufficient sharpness";
+            } else if (!left_quality.coverage_ok || !right_quality.coverage_ok) {
+                rejection = cn ? "棋盘覆盖率不合适" : "unsuitable board coverage";
+            } else {
+                CameraPose lp, rp;
+                const auto& lk = fisheye_stereo ? left_fisheye.camera_matrix : left_mono.camera_matrix;
+                const auto& ld = fisheye_stereo ? left_fisheye.dist_coeffs : left_mono.dist_coeffs;
+                const auto& rk = fisheye_stereo ? right_fisheye.camera_matrix : right_mono.camera_matrix;
+                const auto& rd = fisheye_stereo ? right_fisheye.dist_coeffs : right_mono.dist_coeffs;
+                if (!estimateCameraPose(left_points, board_object_points, image_size, lk, ld, lp, fisheye_stereo) ||
+                    !estimateCameraPose(right_points, board_object_points, image_size, rk, rd, rp, fisheye_stereo) ||
+                    lp.rms_px > app.mono_max_rms || rp.rms_px > app.mono_max_rms) {
+                    rejection = cn ? "位姿求解失败或重投影误差超限" : "pose failed or reprojection RMS too high";
+                }
+            }
+        }
+        // Detection and quality checks can be slow; validate the original
+        // input timestamps again before accepting the pair.
+        if (rejection.empty() && !freshFramePair(left_received, right_received, FrameClock::now()))
+            rejection = cn ? "帧已过期" : "frames expired during processing";
+        std::size_t index = 0;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            if (stereo_progress.calculating) return false;
+            if (rejection.empty() &&
+                (!isNovelMonoSample(accepted_stereo_left, left_points) ||
+                 !isNovelMonoSample(accepted_stereo_right, right_points))) {
+                rejection = cn ? "重复姿态，请移动或倾斜棋盘" : "duplicate view; move or tilt the board";
+            }
+            if (rejection.empty()) {
+                const auto before = fisheye_stereo ? fisheye_calibrator.sampleCount() : calibrator.sampleCount();
+                if (fisheye_stereo) fisheye_calibrator.addSample(left_points, right_points);
+                else calibrator.addSample(left_points, right_points);
+                const auto after = fisheye_stereo ? fisheye_calibrator.sampleCount() : calibrator.sampleCount();
+                if (after == before + 1) {
+                    accepted_stereo_left.push_back(left_points);
+                    accepted_stereo_right.push_back(right_points);
+                } else rejection = cn ? "样本数据无效" : "invalid sample data";
+            }
+            stereo_progress.recordSample(rejection.empty());
+            index = stereo_progress.samples;
+            stereo_sample_status = rejection.empty()
+                ? (cn ? "最近样本：有效" : "Latest sample: valid")
+                : (cn ? "最近样本：无效，" : "Latest sample: rejected, ") + rejection;
+            std::cout << "Stereo samples=" << index << ", valid=" << stereo_progress.valid_samples
+                      << (rejection.empty() ? " accepted" : " rejected: " + rejection) << '\n';
+        }
+        // Preserve rejected captured images too, without feeding them into the fit.
+        try {
+            cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "left_fisheye" : "left", index), left);
+            cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "right_fisheye" : "right", index), right);
+        } catch (const cv::Exception& error) {
+            std::cerr << "Could not save stereo sample images: " << error.what() << '\n';
+        }
+        return rejection.empty();
+    };
+
+    // Run on the analysis thread, outside model_mutex, so the UI can show
+    // 'calculating' and continue previewing while OpenCV solves the extrinsics.
+    auto calculateStereo = [&] {
+        const bool manual = stereo_calculation_requested.exchange(false);
+        StereoCalibrator pinhole_samples(cv::Size(app.board_cols, app.board_rows), app.square_size);
+        FisheyeStereoCalibrator fisheye_samples(cv::Size(app.board_cols, app.board_rows), app.square_size);
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            if (stereo_progress.calculating || (!manual && !stereo_progress.needsAutoCalculation())) return;
+            if (stereo_progress.valid_samples < 8) {
+                stereo_calculation_status = g_text_renderer.available()
+                    ? "手动计算至少需要 8 组有效样本；自动计算目标为 12 组"
+                    : "Manual calculation needs 8 valid samples; automatic target is 12";
+                return;
+            }
+            if (fisheye_stereo) fisheye_samples = fisheye_calibrator;
+            else pinhole_samples = calibrator;
+            stereo_progress.beginCalculation();
+            stereo_calculation_status = g_text_renderer.available() ? "正在计算外参" : "Calculating extrinsics";
+        }
+        StereoCalibrationResult candidate;
+        const bool success = fisheye_stereo
+            ? fisheye_samples.calibrateWithIntrinsics(image_size, left_fisheye, right_fisheye, candidate)
+            : pinhole_samples.calibrateWithIntrinsics(image_size, left_mono, right_mono, candidate);
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            if (success) calibration = candidate;
+            stereo_progress.finishCalculation(success);
+            show_rectified.store(success);
+            if (success) {
+                stereo_calculation_status = stereo_progress.auto_completed
+                    ? (g_text_renderer.available() ? "外参计算成功，自动采样已暂停；R 切换校正，W 保存"
+                                                   : "Extrinsics computed; auto-capture paused. R: toggle rectify, W: save")
+                    : (g_text_renderer.available() ? "外参计算成功；继续采样，满 12 组有效样本自动重算"
+                                                   : "Extrinsics computed; capturing toward 12 valid samples for auto-fit");
+            } else {
+                stereo_calculation_status = g_text_renderer.available()
+                    ? "外参计算失败，请补充新的有效样本后重试；也可按 C 重算"
+                    : "Fit failed; add a new valid sample to retry, or press C";
+            }
+            if (success) std::cout << "Stereo calibration RMS: " << calibration.reprojection_error << " px\n";
+            else std::cerr << "Stereo calibration failed; add diverse valid samples or press C to retry.\n";
+        }
+    };
 
     std::thread analysis_thread([&] {
         std::vector<cv::Point2f> left_corners;
@@ -2967,6 +3114,7 @@ int main(int argc, char** argv) {
         std::uint64_t last_right_seq = 0;
         auto previous_analysis_time = std::chrono::steady_clock::now();
         while (analysis_running.load() && !g_quit.load()) {
+            if (stereo_calibration_mode) calculateStereo();
             cv::Mat left;
             cv::Mat right;
             std::uint64_t left_seq = 0;
@@ -3000,42 +3148,22 @@ int main(int argc, char** argv) {
                 previous_stereo_right = right_corners;
 
                 if (stereo_calibration_mode) {
-                    const MonoFrameQuality left_quality = fisheye_stereo
-                        ? measureMonoFrameQuality(left, left_corners, board_object_points, left_fisheye,
-                              app.mono_min_sharpness, app.mono_min_coverage,
-                              app.mono_max_coverage, app.mono_max_rms, false)
-                        : measureMonoFrameQuality(left, left_corners, board_object_points, left_mono,
-                              app.mono_min_sharpness, app.mono_min_coverage,
-                              app.mono_max_coverage, app.mono_max_rms);
-                    const MonoFrameQuality right_quality = fisheye_stereo
-                        ? measureMonoFrameQuality(right, right_corners, board_object_points, right_fisheye,
-                              app.mono_min_sharpness, app.mono_min_coverage,
-                              app.mono_max_coverage, app.mono_max_rms, false)
-                        : measureMonoFrameQuality(right, right_corners, board_object_points, right_mono,
-                              app.mono_min_sharpness, app.mono_min_coverage,
-                              app.mono_max_coverage, app.mono_max_rms);
                     if (stereo_sample_cooldown > 0) --stereo_sample_cooldown;
                     const bool novel = autoSampleIsDifferent(last_auto_left, left_corners) &&
                                        autoSampleIsDifferent(last_auto_right, right_corners);
-                    if (freshFramePair(left_received, right_received, FrameClock::now()) &&
-                        stereo_stable_frames >= 4 && stereo_sample_cooldown == 0 && novel &&
-                        left_quality.acceptable() && right_quality.acceptable()) {
-                    std::size_t next_index = 0;
+                    bool auto_capture_enabled = false;
                     {
                         std::lock_guard<std::mutex> lock(model_mutex);
-                        next_index = fisheye_stereo ? fisheye_calibrator.sampleCount() + 1
-                                                    : calibrator.sampleCount() + 1;
-                        if (fisheye_stereo) fisheye_calibrator.addSample(left_corners, right_corners);
-                        else calibrator.addSample(left_corners, right_corners);
+                        auto_capture_enabled = !stereo_progress.auto_completed && !stereo_progress.calculating;
                     }
-                    cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "left_fisheye" : "left", next_index), left);
-                    cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "right_fisheye" : "right", next_index), right);
-                    last_auto_left = left_corners;
-                    last_auto_right = right_corners;
-                    stereo_sample_cooldown = 12;
-                    stereo_stable_frames = 0;
-                    std::cout << "Auto-captured " << (fisheye_stereo ? "stereo fisheye" : "stereo")
-                              << " sample " << next_index << "\n";
+                    if (auto_capture_enabled && stereo_stable_frames >= 4 && stereo_sample_cooldown == 0 &&
+                        novel && freshFramePair(left_received, right_received, FrameClock::now())) {
+                        if (captureStereoSample(left, right, left_corners, right_corners, left_received, right_received)) {
+                            last_auto_left = left_corners;
+                            last_auto_right = right_corners;
+                        }
+                        stereo_sample_cooldown = 12;
+                        stereo_stable_frames = 0;
                     }
                 }
             } else {
@@ -3193,6 +3321,7 @@ int main(int argc, char** argv) {
             return false;
         }
         if (key == 'r') {
+            std::lock_guard<std::mutex> lock(model_mutex);
             if (!calibration.valid) {
                 std::cout << "Rectification is unavailable until stereo calibration is computed.\n";
                 return true;
@@ -3243,49 +3372,25 @@ int main(int argc, char** argv) {
                 !right_grabber.get(right, right_seq, &right_received)) {
                 return true;
             }
-            if (left.size() != image_size || right.size() != image_size ||
-                !freshFramePair(left_received, right_received, FrameClock::now())) {
-                std::cout << "Cannot sample: capture resolution or frame timing does not match calibration.\n";
-                return true;
+            raw_left_corners.clear();
+            raw_right_corners.clear();
+            if (left.size() == image_size && right.size() == image_size) {
+                detectScaled(calibrator, left, app.process_scale, raw_left_corners);
+                detectScaled(calibrator, right, app.process_scale, raw_right_corners);
             }
-            const bool sample_left_found = detectScaled(calibrator, left, app.process_scale, raw_left_corners);
-            const bool sample_right_found = detectScaled(calibrator, right, app.process_scale, raw_right_corners);
-            if (sample_left_found && sample_right_found &&
-                freshFramePair(left_received, right_received, FrameClock::now())) {
-                std::size_t next_index = 0;
-                {
-                    std::lock_guard<std::mutex> lock(model_mutex);
-                    next_index = fisheye_stereo ? fisheye_calibrator.sampleCount() + 1
-                                                : calibrator.sampleCount() + 1;
-                    if (fisheye_stereo) fisheye_calibrator.addSample(raw_left_corners, raw_right_corners);
-                    else calibrator.addSample(raw_left_corners, raw_right_corners);
-                }
-                cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "left_fisheye" : "left", next_index), left);
-                cv::imwrite(sampleName(app.capture_dir, fisheye_stereo ? "right_fisheye" : "right", next_index), right);
-                std::cout << "Saved sample " << next_index << "\n";
-            } else {
-                std::cout << "Both cameras must detect the chessboard before saving.\n";
-            }
+            captureStereoSample(left, right, raw_left_corners, raw_right_corners, left_received, right_received);
         }
         if (key == 'c') {
             if (!stereo_calibration_mode) return true;
-            std::lock_guard<std::mutex> lock(model_mutex);
-            const bool calibrated = fisheye_stereo
-                ? fisheye_calibrator.calibrateWithIntrinsics(image_size, left_fisheye, right_fisheye, calibration)
-                : (mono_parameters_loaded
-                    ? calibrator.calibrateWithIntrinsics(image_size, left_mono, right_mono, calibration)
-                    : calibrator.calibrate(image_size, calibration));
-            if (calibrated) {
-                std::cout << "Calibration RMS error: " << calibration.reprojection_error << "\n";
-                show_rectified.store(true);
-            } else {
-                show_rectified.store(false);
-                std::cout << "Stereo calibration failed; need at least 8 valid synchronized samples.\n";
-            }
+            stereo_calculation_requested.store(true);
         }
         if (key == 'w') {
             if (!stereo_calibration_mode) return true;
             std::lock_guard<std::mutex> lock(model_mutex);
+            if (stereo_progress.calculating) {
+                std::cout << "Extrinsics are being calculated; wait before saving.\n";
+                return true;
+            }
             if ((fisheye_stereo ? fisheye_calibrator.save(app.output, calibration)
                                 : calibrator.save(app.output, calibration))) {
                 std::cout << "Wrote " << app.output << "\n";
@@ -3356,16 +3461,20 @@ int main(int argc, char** argv) {
             bool calibration_valid = false;
             double reprojection_error = 0.0;
             double baseline_mm = 0.0;
-            std::size_t sample_count = 0;
+            StereoSamplingProgress progress;
+            std::string sample_status;
+            std::string calculation_status;
             {
                 std::lock_guard<std::mutex> lock(model_mutex);
                 calibration_valid = calibration.valid;
                 reprojection_error = calibration.reprojection_error;
                 baseline_mm = calibration.T.empty() ? 0.0 : cv::norm(calibration.T);
-                sample_count = fisheye_stereo ? fisheye_calibrator.sampleCount() : calibrator.sampleCount();
+                progress = stereo_progress;
+                sample_status = stereo_sample_status;
+                calculation_status = stereo_calculation_status;
             }
             dashboard = makeStereoCalibrationDashboard(left_view, right_view, line1, line2,
-                                                       sample_count, calibration_valid,
+                                                       progress, sample_status, calculation_status, calibration_valid,
                                                        reprojection_error, baseline_mm);
         } else {
             dashboard = makeDashboard(left_view,
