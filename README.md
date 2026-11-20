@@ -45,12 +45,12 @@ cmake --build build -j2
 
 ```bash
 # 鱼眼镜头
-./build/stereo_csi_calibrator --mode fisheye-left --process-scale 0.5
-./build/stereo_csi_calibrator --mode fisheye-right --process-scale 0.5
+./build/stereo_csi_calibrator --mode fisheye-left --width 1920 --height 1080 --fps 30 --process-scale 0.5
+./build/stereo_csi_calibrator --mode fisheye-right --width 1920 --height 1080 --fps 30 --process-scale 0.5
 
 # 针孔镜头
-./build/stereo_csi_calibrator --mode mono-left --process-scale 0.5
-./build/stereo_csi_calibrator --mode mono-right --process-scale 0.5
+./build/stereo_csi_calibrator --mode mono-left --width 1920 --height 1080 --fps 30 --process-scale 0.5
+./build/stereo_csi_calibrator --mode mono-right --width 1920 --height 1080 --fps 30 --process-scale 0.5
 ```
 
 鱼眼默认保存为 `left_fisheye.yml`、`right_fisheye.yml`；针孔默认保存为 `left_camera.yml`、`right_camera.yml`。采样时移动棋盘，覆盖画面不同位置、距离和倾角，每个姿态停稳；避免反光、模糊及所有样本都正对相机。
@@ -58,7 +58,8 @@ cmake --build build -j2
 单目默认自动采集 15 组，至少 8 组才能计算；达到目标且 RMS ≤ 1 px 时自动保存。可用 `--mono-samples 25` 增加目标组数，或按 `S` 手动采样、`C` 重新计算、`W` 强制保存。下游调平及双目模式会拒绝标定 RMS 超过 2 px 的内参。需要更改单目输出位置时加 `--output`，例如：
 
 ```bash
-./build/stereo_csi_calibrator --mode mono-left --output left_custom.yml
+./build/stereo_csi_calibrator --mode mono-left \
+  --width 1920 --height 1080 --fps 30 --output left_custom.yml
 ```
 
 ### 2. 物理调平
@@ -69,11 +70,13 @@ cmake --build build -j2
 # 鱼眼镜头
 ./build/stereo_csi_calibrator --mode physical-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --width 1920 --height 1080 --fps 30 \
   --process-scale 0.5
 
 # 针孔镜头
 ./build/stereo_csi_calibrator --mode physical \
   --left-mono left_camera.yml --right-mono right_camera.yml \
+  --width 1920 --height 1080 --fps 30 \
   --process-scale 0.5
 ```
 
@@ -87,11 +90,13 @@ cmake --build build -j2
 # 鱼眼双目标定
 ./build/stereo_csi_calibrator --mode stereo-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --width 1920 --height 1080 --fps 30 \
   --process-scale 0.5
 
 # 针孔双目标定
 ./build/stereo_csi_calibrator --mode stereo \
   --left-mono left_camera.yml --right-mono right_camera.yml \
+  --width 1920 --height 1080 --fps 30 \
   --process-scale 0.5
 ```
 
