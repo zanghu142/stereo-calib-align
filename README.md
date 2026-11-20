@@ -45,12 +45,28 @@ cmake --build build -j2
 
 ```bash
 # 鱼眼镜头
-./build/stereo_csi_calibrator --mode fisheye-left --width 1920 --height 1080 --fps 30 --process-scale 0.5
-./build/stereo_csi_calibrator --mode fisheye-right --width 1920 --height 1080 --fps 30 --process-scale 0.5
+./build/stereo_csi_calibrator --mode fisheye-left \
+  --left-device /dev/video0 --right-device /dev/video1 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
+./build/stereo_csi_calibrator --mode fisheye-right \
+  --left-device /dev/video0 --right-device /dev/video1 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 
 # 针孔镜头
-./build/stereo_csi_calibrator --mode mono-left --width 1920 --height 1080 --fps 30 --process-scale 0.5
-./build/stereo_csi_calibrator --mode mono-right --width 1920 --height 1080 --fps 30 --process-scale 0.5
+./build/stereo_csi_calibrator --mode mono-left \
+  --left-device /dev/video0 --right-device /dev/video1 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
+./build/stereo_csi_calibrator --mode mono-right \
+  --left-device /dev/video0 --right-device /dev/video1 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 ```
 
 鱼眼默认保存为 `left_fisheye.yml`、`right_fisheye.yml`；针孔默认保存为 `left_camera.yml`、`right_camera.yml`。采样时移动棋盘，覆盖画面不同位置、距离和倾角，每个姿态停稳；避免反光、模糊及所有样本都正对相机。
@@ -59,7 +75,10 @@ cmake --build build -j2
 
 ```bash
 ./build/stereo_csi_calibrator --mode mono-left \
-  --width 1920 --height 1080 --fps 30 --output left_custom.yml
+  --left-device /dev/video0 --right-device /dev/video1 \
+  --width 1920 --height 1080 --fps 30 \
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --output left_custom.yml --capture-dir captures
 ```
 
 ### 2. 物理调平
@@ -70,14 +89,18 @@ cmake --build build -j2
 # 鱼眼镜头
 ./build/stereo_csi_calibrator --mode physical-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --left-device /dev/video0 --right-device /dev/video1 \
   --width 1920 --height 1080 --fps 30 \
-  --process-scale 0.5
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 
 # 针孔镜头
 ./build/stereo_csi_calibrator --mode physical \
   --left-mono left_camera.yml --right-mono right_camera.yml \
+  --left-device /dev/video0 --right-device /dev/video1 \
   --width 1920 --height 1080 --fps 30 \
-  --process-scale 0.5
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 ```
 
 两路同时检测到棋盘后显示当前帧的测量估计，无需双目外参或多视角采样。数据无效或过期时眼距显示 `--`。此模式用于观察和调整，`S/C/W` 不执行标定，`R` 不提供校正预览。
@@ -90,14 +113,18 @@ cmake --build build -j2
 # 鱼眼双目标定
 ./build/stereo_csi_calibrator --mode stereo-fisheye \
   --left-fisheye left_fisheye.yml --right-fisheye right_fisheye.yml \
+  --left-device /dev/video0 --right-device /dev/video1 \
   --width 1920 --height 1080 --fps 30 \
-  --process-scale 0.5
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 
 # 针孔双目标定
 ./build/stereo_csi_calibrator --mode stereo \
   --left-mono left_camera.yml --right-mono right_camera.yml \
+  --left-device /dev/video0 --right-device /dev/video1 \
   --width 1920 --height 1080 --fps 30 \
-  --process-scale 0.5
+  --board-cols 11 --board-rows 8 --square-size 50 \
+  --process-scale 0.5 --capture-dir captures
 ```
 
 让同一棋盘完整出现在两路画面中，自动或按 `S` 采集不同姿态。界面分别显示**样本数**和**有效样本数**：总数统计左右双路采样尝试，包括未识别棋盘、过期帧等无效项；只有时间、尺寸、清晰度、覆盖率、位姿 RMS（默认 ≤ 1 px）和姿态去重检查通过的样本才计为有效并参与计算。拒绝的样本会显示原因。
